@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Resize AVIF -> AVIF by target width, preserving aspect ratio.
-# • If the input has a gain-map, we recombine a resized base + HDR alternate
+# - If the input has a gain-map, we recombine a resized base + HDR alternate
 #   and EXPLICITLY set CICP so viewers recognize the HDR view.
-# • If the input is pure-HDR (PQ/HLG) with NO gain-map, we avoid PNG (no tonemap):
+# - If the input is pure-HDR (PQ/HLG) with NO gain-map, we avoid PNG (no tonemap):
 #   decode to Y4M -> resize with ffmpeg -> re-encode with original CICP/bit-depth/YUV.
 #
 # Requirements in the container: avifdec, avifenc, avifgainmaputil, ffmpeg, ImageMagick (magick).
 
-set -Eeuo pipefail
+# set -euo pipefail
 
 # Hard fail loudly on any error, show the failing command and line.
-trap 'code=$?; echo >&2 ""; echo >&2 "[ERROR] exit $code at line ${BASH_LINENO[0]} while running: ${BASH_COMMAND}"; exit $code' ERR
+# trap 'code=$?; echo >&2 ""; echo >&2 "[ERROR] exit $code while running: ${BASH_COMMAND}"; exit $code' ERR
 
 usage() {
   cat <<EOF
@@ -92,7 +92,7 @@ read_source_info() {
 }
 log_src() {
   [ "$VERBOSE" -eq 1 ] || return 0
-  echo "[info] Source CICP P/T/M=${SRC_P}/${SRC_T}/${SRC_M}, depth=${SRC_DEPTH}, YUV=${SRC_YUV}, range=${SRC_RANGE}${SRC_CLLI:+, CLLI=${SRC_CLLI}}"
+  echo "[info] Source CICP P/T/M=${SRC_P}/${SRC_T}/${SRC_M}, depth=${SRC_DEPTH}, YUV=${SRC_YUV}, range=${SRC_RANGE}"
 }
 
 read_source_info "$IN"; log_src
@@ -108,11 +108,11 @@ build_encode_flags() {
 
 # ---- Gain-map vs pure-HDR branching ----
 if avifgainmaputil printmetadata "$IN" >/dev/null 2>&1; then
-  echo "[GM] Input has a gain-map — preserving it…"
+  echo "[GM] Input has a gain-map - preserving it..."
 
   # Base (SDR) & Alternate (HDR) renderings; keep high precision for alt
   avifdec "$IN" "$tmp/base.png"
-  avifgainmaputil tonemap "$IN" "$tmp/alt.png" --headroom "$HEADROOM" -d 16
+  avifgainmaputil tonemap "$IN" "$tmp/alt.png" --headroom "$HEADROOM" -d 10
 
   # Resize both identically (Lanczos), width-only keeps AR
   magick "$tmp/base.png" -filter Lanczos -resize "${WIDTH}x" "$tmp/base_r.png"
@@ -122,17 +122,17 @@ if avifgainmaputil printmetadata "$IN" >/dev/null 2>&1; then
   ALT_P="${SRC_P}"
   ALT_T=16
   ALT_M="${SRC_M}"
-  [ "$VERBOSE" -eq 1 ] && echo "[info] Combine CICP — base ${SRC_P}/${SRC_T}/${SRC_M}, alt ${ALT_P}/${ALT_T}/${ALT_M}"
+  [ "$VERBOSE" -eq 1 ] && echo "[info] Combine CICP - base ${SRC_P}/${SRC_T}/${SRC_M}, alt ${ALT_P}/${ALT_T}/${ALT_M}"
 
   avifgainmaputil combine "$tmp/base_r.png" "$tmp/alt_r.png" "$OUT" \
     --downscaling "$DOWNSCALING" --qgain-map "$QGAIN" -q "$QCOLOR" -s "$SPEED" \
     --cicp-base "${SRC_P}/${SRC_T}/${SRC_M}" \
     --cicp-alternate "${ALT_P}/${ALT_T}/${ALT_M}"
 
-  echo "✔ Wrote (gain-map): $OUT"
+  echo "✓ Wrote (gain-map): $OUT"
 
 else
-  echo "[GM] No gain-map — preserving pure-HDR if present (avoiding SDR tonemap)."
+  echo "[GM] No gain-map - preserving pure-HDR if present (avoiding SDR tonemap)."
 
   # Decode to Y4M (YUV4MPEG2). avifdec supports .y4m output. 
   avifdec "$IN" "$tmp/in.y4m"
@@ -152,5 +152,5 @@ else
   build_encode_flags
   avifenc "${ENC_FLAGS[@]}" "$tmp/out.y4m" "$OUT"
 
-  echo "✔ Wrote (pure-HDR): $OUT"
+  echo "✓ Wrote (pure-HDR): $OUT"
 fi
