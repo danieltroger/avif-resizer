@@ -7,6 +7,7 @@ ARG LIBAVIF_VERSION=v1.3.0
 # Build deps + ImageMagick for high-quality resizing
 RUN apt-get update && apt-get install -y \
     build-essential cmake ninja-build git pkg-config ca-certificates \
+    python3 meson nasm \
     imagemagick libxml2-dev && \
     rm -rf /var/lib/apt/lists/*
 
@@ -15,7 +16,9 @@ RUN apt-get update && apt-get install -y \
 RUN git clone --depth=1 --branch ${LIBAVIF_VERSION} https://github.com/AOMediaCodec/libavif.git /opt/libavif && \
     cmake -S /opt/libavif -B /opt/libavif/build -G Ninja \
       -DAVIF_BUILD_APPS=ON \
-      -DAVIF_ENABLE_EXPERIMENTAL_GAIN_MAP=ON \
+      # If using libavif >= 1.2.0, drop the old experimental flag:
+      # (gain-map API is enabled by default)
+      # -DAVIF_ENABLE_EXPERIMENTAL_GAIN_MAP=ON \
       -DAVIF_CODEC_AOM=LOCAL \
       -DAVIF_CODEC_DAV1D=LOCAL \
       -DAVIF_LIBYUV=LOCAL \
