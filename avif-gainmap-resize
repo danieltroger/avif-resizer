@@ -61,6 +61,13 @@ IN="$1"; OUT="$2"
 need() { command -v "$1" >/dev/null 2>&1 || { echo >&2 "[FATAL] '$1' not found in PATH"; exit 127; }; }
 need avifdec; need avifenc; need avifgainmaputil; need ffmpeg; need magick
 
+# AWK selection: prefer gawk; fall back to awk if present
+if command -v gawk >/dev/null 2>&1; then AWK_BIN="gawk"
+elif command -v awk >/dev/null 2>&1; then AWK_BIN="awk"
+else
+  echo >&2 "[FATAL] Neither 'gawk' nor 'awk' found in PATH"; exit 127
+fi
+
 # Verbose trace if asked
 if [ "$VERBOSE" -eq 1 ]; then set -x; fi
 
@@ -71,16 +78,16 @@ read_source_info() {
   local f="$1" info
   info="$(avifdec --info "$f" 2>&1 || true)"
 
-  # Use awk to be robust against spacing/asterisks
-  SRC_P="$(awk -F: '/Color Primaries/{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_T="$(awk -F: '/Transfer Char\./{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_M="$(awk -F: '/Matrix Coeffs\./{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_DEPTH="$(awk -F: '/Bit Depth/{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_YUV="$(awk -F: '/Format/{if($2~/(YUV[0-9]+)/){match($2,/YUV([0-9]+)/,m);print m[1]}}' <<<"$info" || true)"
-  SRC_RANGE="$(awk -F: '/Range/{gsub(/^[[:space:]]+|[[:space:]].*/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_CLLI="$(awk -F: '/CLLI/{gsub(/[[:space:]]/,"",$2);print $2; exit}' <<<"$info" || true)"
+  # Use gawk/awk to be robust against spacing and leading '*'
+  SRC_P="$("$AWK_BIN" -F: '/Color Primaries/{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
+  SRC_T="$("$AWK_BIN" -F: '/Transfer Char\./{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
+  SRC_M="$("$AWK_BIN" -F: '/Matrix Coeffs\./{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
+  SRC_DEPTH="$("$AWK_BIN" -F: '/Bit Depth/{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
+  SRC_YUV="$("$AWK_BIN" -F: '/Format/{if($2~/(YUV[0-9]+)/){match($2,/YUV([0-9]+)/,m);print m[1]}}' <<<"$info" || true)"
+  SRC_RANGE="$("$AWK_BIN" -F: '/Range/{gsub(/^[[:space:]]+|[[:space:]].*/,"",$2);print $2; exit}' <<<"$info" || true)"
+  SRC_CLLI="$("$AWK_BIN" -F: '/CLLI/{gsub(/[[:space:]]/,"",$2);print $2; exit}' <<<"$info" || true)"
 
-  # Fallbacks (use explicit if, not &&/|| to avoid set -e pitfalls)
+  # Fallbacks (explicit ifs to avoid set -e pitfalls)
   if [ -z "${SRC_P}" ];     then SRC_P=1; fi
   if [ -z "${SRC_T}" ];     then SRC_T=13; fi
   if [ -z "${SRC_M}" ];     then SRC_M=6; fi
@@ -98,10 +105,15 @@ read_source_info "$IN"; log_src
 # ---- Build avifenc flags for pure-HDR path ----
 build_encode_flags() {
   ENC_FLAGS=( -q "$QCOLOR" -s "$SPEED" --cicp "${SRC_P}/${SRC_T}/${SRC_M}" )
-  # These are ignored for Y4M (depth/subsampling comes from the stream), but harmless:
+  # For Y4M input, depth/subsampling come from the stream, but passing is harmless:
   ENC_FLAGS+=( --depth "${SRC_DEPTH}" --yuv "${SRC_YUV}" )
   if [ "${SRC_RANGE}" = "Full" ]; then ENC_FLAGS+=( --range full ); else ENC_FLAGS+=( --range limited ); fi
   if [ -n "${SRC_CLLI:-}" ]; then ENC_FLAGS+=( --clli "${SRC_CLLI}" ); fi
+}
+
+# Check if combine supports explicit CICP flags (older builds might not)
+gainmaputil_supports_cicp() {
+  avifgainmaputil combine --help 2>&1 | grep -q -- '--cicp-base'
 }
 
 # ---- Gain-map vs pure-HDR branching ----
@@ -120,14 +132,19 @@ if avifgainmaputil printmetadata "$IN" >/dev/null 2>&1; then
   ALT_P="${SRC_P}"
   ALT_T=16
   ALT_M="${SRC_M}"
-  if [ "$VERBOSE" -eq 1 ]; then
-    echo "[info] Combine CICP — base ${SRC_P}/${SRC_T}/${SRC_M}, alt ${ALT_P}/${ALT_T}/${ALT_M}"
-  fi
 
-  avifgainmaputil combine "$tmp/base_r.png" "$tmp/alt_r.png" "$OUT" \
-    --downscaling "$DOWNSCALING" --qgain-map "$QGAIN" -q "$QCOLOR" -s "$SPEED" \
-    --cicp-base "${SRC_P}/${SRC_T}/${SRC_M}" \
-    --cicp-alternate "${ALT_P}/${ALT_T}/${ALT_M}"
+  if gainmaputil_supports_cicp; then
+    [ "$VERBOSE" -eq 1 ] && echo "[info] Combine CICP — base ${SRC_P}/${SRC_T}/${SRC_M}, alt ${ALT_P}/${ALT_T}/${ALT_M}"
+    avifgainmaputil combine "$tmp/base_r.png" "$tmp/alt_r.png" "$OUT" \
+      --downscaling "$DOWNSCALING" --qgain-map "$QGAIN" -q "$QCOLOR" -s "$SPEED" \
+      --cicp-base "${SRC_P}/${SRC_T}/${SRC_M}" \
+      --cicp-alternate "${ALT_P}/${ALT_T}/${ALT_M}"
+  else
+    echo "[warn] avifgainmaputil lacks --cicp-base/--cicp-alternate; combining without explicit alt CICP."
+    avifgainmaputil combine "$tmp/base_r.png" "$tmp/alt_r.png" "$OUT" \
+      --downscaling "$DOWNSCALING" --qgain-map "$QGAIN" -q "$QCOLOR" -s "$SPEED"
+    echo "[warn] Result may mark alternate transfer as 'unspecified'. Verify with: avifgainmaputil printmetadata \"$OUT\""
+  fi
 
   echo "✔ Wrote (gain-map): $OUT"
 
@@ -135,7 +152,10 @@ else
   echo "[GM] No gain-map — preserving pure-HDR if present (avoiding SDR tonemap)."
 
   # Decode to Y4M (keeps YUV samples), resize in YUV, then re-encode with original CICP
-  avifdec "$IN" "$tmp/in.y4m"
+  if ! avifdec "$IN" "$tmp/in.y4m"; then
+    echo "[info] avifdec -> y4m failed; falling back to ffmpeg decode"
+    ffmpeg -nostdin -hide_banner -loglevel error -y -i "$IN" -pix_fmt yuv444p10le "$tmp/in.y4m"
+  fi
 
   # Pick pixel format consistent with source depth/YUV (yuv444p10le, etc.)
   case "${SRC_YUV}" in 444|422|420|400) ;; *) SRC_YUV=444 ;; esac
