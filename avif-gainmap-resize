@@ -127,39 +127,45 @@ build_encode_flags() {
 
 # ---- Gain-map vs pure-HDR branching ----
 if avifgainmaputil printmetadata "$IN" >/dev/null 2>&1; then
-  echo "[GM] Input has a gain-map - preserving it..."
-
-  # Base (SDR) & Alternate (HDR) renderings; keep high precision for alt
-  avifdec "$IN" "$tmp/base.png"
+  echo "[GM] Input has a gain-map - converting to PQ for resize..."
+  echo "[WARNING] Gain maps cannot be properly preserved during resize with current tools."
+  echo "[INFO] Converting to pure HDR (PQ) format instead, which preserves colors correctly."
   
-  # Try to extract the original alternate image instead of tonemapping
-  # This should preserve the original color characteristics better
-  if avifgainmaputil swapbase "$IN" "$tmp/alt_temp.avif" 2>/dev/null; then
-    avifdec "$tmp/alt_temp.avif" "$tmp/alt.png"
-    [ "$VERBOSE" -eq 1 ] && echo "[info] Using original alternate image"
+  # Extract the HDR version (alternate image) and treat it as a pure HDR file
+  if avifgainmaputil swapbase "$IN" "$tmp/hdr_version.avif" 2>/dev/null; then
+    # Decode the HDR version to PNG
+    avifdec "$tmp/hdr_version.avif" "$tmp/hdr.png"
+    
+    # Resize with ImageMagick
+    magick "$tmp/hdr.png" -filter Lanczos -resize "${WIDTH}x" "$tmp/hdr_r.png"
+    
+    # Get the HDR version's metadata
+    hdr_info="$(avifdec --info "$tmp/hdr_version.avif" 2>&1 || true)"
+    HDR_P="$(echo "$hdr_info" | grep -Eo "Color Primaries[[:space:]]*:[[:space:]]*[0-9]+" | head -n1 | grep -Eo "[0-9]+" || echo "9")"
+    HDR_T="$(echo "$hdr_info" | grep -Eo "Transfer Char\.[[:space:]]*:[[:space:]]*[0-9]+" | head -n1 | grep -Eo "[0-9]+" || echo "16")"
+    HDR_M="$(echo "$hdr_info" | grep -Eo "Matrix Coeffs\.[[:space:]]*:[[:space:]]*[0-9]+" | head -n1 | grep -Eo "[0-9]+" || echo "9")"
+    HDR_CLLI="$(echo "$hdr_info" | grep -Eo "CLLI[[:space:]]*:[[:space:]]*[0-9]+,[[:space:]]*[0-9]+" | sed 's/.*://;s/[[:space:]]//g' || true)"
+    
+    # Encode as pure HDR with PQ
+    ENC_FLAGS=( -q "$QCOLOR" -s "$SPEED" --cicp "${HDR_P}/${HDR_T}/${HDR_M}" )
+    ENC_FLAGS+=( --depth 10 --yuv 444 --range full )
+    if [ -n "${HDR_CLLI:-}" ]; then ENC_FLAGS+=( --clli "${HDR_CLLI}" ); fi
+    
+    avifenc "${ENC_FLAGS[@]}" "$tmp/hdr_r.png" "$OUT"
+    
+    echo "✓ Wrote (converted from gain-map to pure HDR): $OUT"
+    echo "[INFO] Output is pure HDR (PQ) without gain-map. Colors preserved correctly."
   else
-    # Fallback to tonemapping if swapbase fails
-    avifgainmaputil tonemap "$IN" "$tmp/alt.png" --headroom "$HEADROOM" -d 10
-    [ "$VERBOSE" -eq 1 ] && echo "[info] Using tonemapped alternate image"
+    # Fallback: just resize the base image as SDR
+    echo "[ERROR] Could not extract HDR from gain-map. Falling back to SDR resize."
+    avifdec "$IN" "$tmp/base.png"
+    magick "$tmp/base.png" -filter Lanczos -resize "${WIDTH}x" "$tmp/base_r.png"
+    
+    build_encode_flags
+    avifenc "${ENC_FLAGS[@]}" "$tmp/base_r.png" "$OUT"
+    
+    echo "✓ Wrote (SDR fallback): $OUT"
   fi
-
-  # Resize both identically (Lanczos), width-only keeps AR
-  magick "$tmp/base.png" -filter Lanczos -resize "${WIDTH}x" "$tmp/base_r.png"
-  magick "$tmp/alt.png"  -filter Lanczos -resize "${WIDTH}x" "$tmp/alt_r.png"
-
-  # Use the base's original CICP; make alternate explicit PQ (16) so HDR is recognized
-  # But preserve the original matrix coefficients for better color accuracy
-  ALT_P="${SRC_P}"
-  ALT_T=16
-  ALT_M="${SRC_M}"
-  [ "$VERBOSE" -eq 1 ] && echo "[info] Combine CICP - base ${SRC_P}/${SRC_T}/${SRC_M}, alt ${ALT_P}/${ALT_T}/${ALT_M}"
-
-  avifgainmaputil combine "$tmp/base_r.png" "$tmp/alt_r.png" "$OUT" \
-    --downscaling "$DOWNSCALING" --qgain-map "$QGAIN" -q "$QCOLOR" -s "$SPEED" \
-    --cicp-base "${SRC_P}/${SRC_T}/${SRC_M}" \
-    --cicp-alternate "${ALT_P}/${ALT_T}/${ALT_M}"
-
-  echo "✓ Wrote (gain-map): $OUT"
 
 else
   echo "[GM] No gain-map - preserving pure-HDR if present (avoiding SDR tonemap)."
