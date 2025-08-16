@@ -143,11 +143,11 @@ else
   FMT="yuv${SRC_YUV}p${SRC_DEPTH}le"
 
   # Resize in YUV without color transforms; keep AR with height=-2
-  ffmpeg -nostdin -hide_banner -loglevel error -y \
+  ffmpeg -nostdin -hide_banner -loglevel error -strict -1 -y \
     -i "$tmp/in.y4m" \
     -vf "scale=${WIDTH}:-2:flags=lanczos" \
     -pix_fmt "$FMT" \
-    "$tmp/out.y4m"
+     -strict -1  "$tmp/out.y4m"
 
   build_encode_flags
   avifenc "${ENC_FLAGS[@]}" "$tmp/out.y4m" "$OUT"
