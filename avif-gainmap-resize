@@ -58,7 +58,7 @@ IN="$1"; OUT="$2"
 # ---- Tools ----
 need() { command -v "$1" >/dev/null 2>&1 || { echo >&2 "[FATAL] '$1' not found in PATH"; exit 127; }; }
 need avifdec; need avifenc; need avifgainmaputil; need ffmpeg; need magick
-if command -v gawk >/dev/null 2>&1; then AWK_BIN="gawk"; elif command -v awk >/dev/null 2>&1; then AWK_BIN="awk"; else echo >&2 "[FATAL] no awk"; exit 127; fi
+if command -v gawk >/dev/null 2>&1; then AWK_BIN="gawk"; elif command -v awk >/dev/null 2>&1; then AWK_BIN="awk"; else echo >&2 "[FATAL] neither 'gawk' nor 'awk' found"; exit 127; fi
 
 # Optional tracing
 if [ "$VERBOSE" -eq 1 ]; then set -x; fi
@@ -101,22 +101,22 @@ build_encode_flags() {
 }
 gainmaputil_supports_cicp() { avifgainmaputil combine --help 2>&1 | grep -q -- '--cicp-base'; }
 
-# Try tonemap with the highest supported depth (16→12→10→8→0) without tripping set -e
+# Try tonemap with safest sequence: (no -d) → 12 → 10 → 8 → 0
 tonemap_alt() {
   local in="$1" out="$2" head="$3"
-  for d in 16 12 10 8 0; do
-    set +e
-    avifgainmaputil tonemap "$in" "$out" --headroom "$head" -d "$d"
-    rc=$?
-    set -e
-    if [ $rc -eq 0 ]; then
-      [ "$VERBOSE" -eq 1 ] && echo "[info] tonemap succeeded with -d $d"
+  if avifgainmaputil tonemap "$in" "$out" --headroom "$head"; then
+    [ "$VERBOSE" -eq 1 ] && echo "[info] tonemap OK (default depth)"
+    return 0
+  fi
+  for d in 12 10 8 0; do
+    if avifgainmaputil tonemap "$in" "$out" --headroom "$head" -d "$d"; then
+      [ "$VERBOSE" -eq 1 ] && echo "[info] tonemap OK with -d $d"
       return 0
     else
       [ "$VERBOSE" -eq 1 ] && echo "[warn] tonemap -d $d failed; trying next"
     fi
   done
-  echo >&2 "[FATAL] avifgainmaputil tonemap failed at all tested depths (16,12,10,8,0)"
+  echo >&2 "[FATAL] avifgainmaputil tonemap failed for all tested modes"
   return 1
 }
 
