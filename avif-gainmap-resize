@@ -87,6 +87,10 @@ read_source_info() {
   fi
   SRC_CLLI="$(echo "$info" | grep -Eo "CLLI[[:space:]]*:[[:space:]]*[0-9]+,[[:space:]]*[0-9]+" | sed 's/.*://;s/[[:space:]]//g' || true)"
 
+  # Extract gain-map matrix coefficients if present
+  GAINMAP_M="$(echo "$info" | grep -A 10 "Gain map" | grep "Matrix Coeffs" | grep -Eo "[0-9]+" | head -n1 || echo "2")"
+  [ "$VERBOSE" -eq 1 ] && echo "[debug] Original gain-map Matrix Coeffs: ${GAINMAP_M}"
+
   # Fallbacks if parsing fails
   [ -z "${SRC_P}" ] && SRC_P=1 || true
   [ -z "${SRC_T}" ] && SRC_T=13 || true
@@ -127,13 +131,24 @@ if avifgainmaputil printmetadata "$IN" >/dev/null 2>&1; then
 
   # Base (SDR) & Alternate (HDR) renderings; keep high precision for alt
   avifdec "$IN" "$tmp/base.png"
-  avifgainmaputil tonemap "$IN" "$tmp/alt.png" --headroom "$HEADROOM" -d 10
+  
+  # Try to extract the original alternate image instead of tonemapping
+  # This should preserve the original color characteristics better
+  if avifgainmaputil swapbase "$IN" "$tmp/alt_temp.avif" 2>/dev/null; then
+    avifdec "$tmp/alt_temp.avif" "$tmp/alt.png"
+    [ "$VERBOSE" -eq 1 ] && echo "[info] Using original alternate image"
+  else
+    # Fallback to tonemapping if swapbase fails
+    avifgainmaputil tonemap "$IN" "$tmp/alt.png" --headroom "$HEADROOM" -d 10
+    [ "$VERBOSE" -eq 1 ] && echo "[info] Using tonemapped alternate image"
+  fi
 
   # Resize both identically (Lanczos), width-only keeps AR
   magick "$tmp/base.png" -filter Lanczos -resize "${WIDTH}x" "$tmp/base_r.png"
   magick "$tmp/alt.png"  -filter Lanczos -resize "${WIDTH}x" "$tmp/alt_r.png"
 
   # Use the base's original CICP; make alternate explicit PQ (16) so HDR is recognized
+  # But preserve the original matrix coefficients for better color accuracy
   ALT_P="${SRC_P}"
   ALT_T=16
   ALT_M="${SRC_M}"
