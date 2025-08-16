@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Resize AVIF -> AVIF by target width, preserving AR.
-# - Gain‑map inputs: extract base (SDR) + render HDR alternate, resize both,
-#   then recombine with explicit CICP so HDR is recognized.
-# - Pure‑HDR inputs (PQ/HLG, no gain‑map): avoid PNG (no tonemap); decode to Y4M,
-#   resize with ffmpeg, then re‑encode with original CICP/bit‑depth/YUV.
+# Resize AVIF -> AVIF by target width, preserving aspect ratio.
+# - If the input has a gain-map, we recombine a resized base + HDR alternate
+#   and EXPLICITLY set CICP so viewers recognize the HDR view.
+# - If the input is pure-HDR (PQ/HLG) with NO gain-map, we avoid PNG (no tonemap):
+#   decode to Y4M -> resize with ffmpeg -> re-encode with original CICP/bit-depth/YUV.
+#
+# Requirements in the container: avifdec, avifenc, avifgainmaputil, ffmpeg, ImageMagick (magick).
 
 set -Eeuo pipefail
 trap 'rc=$?; echo >&2; echo >&2 "[ERROR] exit $rc at line ${BASH_LINENO[0]} while running: ${BASH_COMMAND}"; exit $rc' ERR
@@ -20,8 +22,8 @@ Quality/speed (defaults):
       --qgain  <0-100>       Gain-map quality (default: 60)
   -s, --speed  <0-10>        Encoder speed (default: 6)
       --downscaling <1|2|4>  Store gain-map at 1/x resolution (default: 2)
-      --headroom <float>     HDR headroom (stops) for gain-map alt render (default: 4)
-      --verbose              Trace + print metadata of outputs
+      --headroom <float>     HDR headroom in stops for gain-map alt render (default: 4)
+      --verbose              Print detected CICP/bit-depth/YUV and commands
 
 Examples:
   $(basename "$0") -w 2048 input-gainmap.avif out-gm.avif --verbose
@@ -55,129 +57,135 @@ done
 if [ -z "${WIDTH}" ] || [ $# -lt 2 ]; then usage; exit 1; fi
 IN="$1"; OUT="$2"
 
-# ---- Tools ----
+# ---- Tool checks ----
 need() { command -v "$1" >/dev/null 2>&1 || { echo >&2 "[FATAL] '$1' not found in PATH"; exit 127; }; }
 need avifdec; need avifenc; need avifgainmaputil; need ffmpeg; need magick
-if command -v gawk >/dev/null 2>&1; then AWK_BIN="gawk"; elif command -v awk >/dev/null 2>&1; then AWK_BIN="awk"; else echo >&2 "[FATAL] neither 'gawk' nor 'awk' found"; exit 127; fi
 
-# Optional tracing
+# Verbose tracing of commands (optional)
 if [ "$VERBOSE" -eq 1 ]; then set -x; fi
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
-# ---- Read source metadata (CICP/bit-depth/YUV/range/CLLI) ----
+# ---- Read source metadata (CICP, depth, YUV, range, CLLI) ----
 read_source_info() {
   local f="$1" info
   info="$(avifdec --info "$f" 2>&1 || true)"
 
-  SRC_P="$("$AWK_BIN" -F: '/Color Primaries/{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_T="$("$AWK_BIN" -F: '/Transfer Char\./{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_M="$("$AWK_BIN" -F: '/Matrix Coeffs\./{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_DEPTH="$("$AWK_BIN" -F: '/Bit Depth/{gsub(/[^0-9]/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_YUV="$("$AWK_BIN" -F: '/Format/{if($2~/(YUV[0-9]+)/){match($2,/YUV([0-9]+)/,m);print m[1]}}' <<<"$info" || true)"
-  SRC_RANGE="$("$AWK_BIN" -F: '/Range/{gsub(/^[[:space:]]+|[[:space:]].*/,"",$2);print $2; exit}' <<<"$info" || true)"
-  SRC_CLLI="$("$AWK_BIN" -F: '/CLLI/{gsub(/[[:space:]]/,"",$2);print $2; exit}' <<<"$info" || true)"
+  get_num() { echo "$info" | grep -Eo "$1[[:space:]]*:[[:space:]]*[0-9]+" | head -n1 | grep -Eo "[0-9]+" || true; }
+  SRC_P="$(get_num "Color Primaries")"
+  SRC_T="$(get_num "Transfer Char\.")"
+  SRC_M="$(get_num "Matrix Coeffs\.")"
+  SRC_DEPTH="$(echo "$info" | grep -Eo "Bit Depth[[:space:]]*:[[:space:]]*[0-9]+" | head -n1 | grep -Eo "[0-9]+" || true)"
+  SRC_YUV="$(echo "$info" | grep -Eo "Format[[:space:]]*:[[:space:]]*YUV[0-9]+" | head -n1 | grep -Eo "[0-9]+" || true)"
+  SRC_RANGE="$(echo "$info" | sed -n 's/.*Range[[:space:]]*:[[:space:]]*\(Full\|Limited\).*/\1/p' | head -n1 || echo "Full")"
+  [ "$VERBOSE" -eq 1 ] && echo "[debug] Parsed SRC_RANGE: '${SRC_RANGE}'"
+  
+  # Force Full range for PQ/HLG content to avoid color issues
+  if [ "${SRC_T}" = "16" ] || [ "${SRC_T}" = "14" ]; then
+    SRC_RANGE="Full"
+    [ "$VERBOSE" -eq 1 ] && echo "[debug] Forcing Full range for PQ/HLG content"
+  fi
+  SRC_CLLI="$(echo "$info" | grep -Eo "CLLI[[:space:]]*:[[:space:]]*[0-9]+,[[:space:]]*[0-9]+" | sed 's/.*://;s/[[:space:]]//g' || true)"
 
-  # Fallbacks
-  if [ -z "${SRC_P}" ];     then SRC_P=1; fi
-  if [ -z "${SRC_T}" ];     then SRC_T=13; fi
-  if [ -z "${SRC_M}" ];     then SRC_M=6; fi
-  if [ -z "${SRC_DEPTH}" ]; then SRC_DEPTH=10; fi
-  if [ -z "${SRC_YUV}" ];   then SRC_YUV=444; fi
-  if [ -z "${SRC_RANGE}" ]; then SRC_RANGE="Full"; fi
+  # Fallbacks if parsing fails
+  [ -z "${SRC_P}" ] && SRC_P=1 || true
+  [ -z "${SRC_T}" ] && SRC_T=13 || true
+  [ -z "${SRC_M}" ] && SRC_M=6 || true
+  [ -z "${SRC_DEPTH}" ] && SRC_DEPTH=10 || true
+  [ -z "${SRC_YUV}" ] && SRC_YUV=444 || true
 }
 log_src() {
   [ "$VERBOSE" -eq 1 ] || return 0
-  echo "[info] Source CICP P/T/M=${SRC_P}/${SRC_T}/${SRC_M}, depth=${SRC_DEPTH}, YUV=${SRC_YUV}, range=${SRC_RANGE}${SRC_CLLI:+, CLLI=${SRC_CLLI}}"
+  echo "[info] Source CICP P/T/M=${SRC_P}/${SRC_T}/${SRC_M}, depth=${SRC_DEPTH}, YUV=${SRC_YUV}, range=${SRC_RANGE}"
 }
+
+log_encode_flags() {
+  [ "$VERBOSE" -eq 1 ] || return 0
+  echo "[info] Encoding flags: ${ENC_FLAGS[*]}"
+}
+
 read_source_info "$IN"; log_src
 
-# ---- Helpers ----
+# ---- Build avifenc flags for pure-HDR path ----
 build_encode_flags() {
   ENC_FLAGS=( -q "$QCOLOR" -s "$SPEED" --cicp "${SRC_P}/${SRC_T}/${SRC_M}" )
+  # depth and yuv are ignored for y4m input (retained from y4m), but harmless:
   ENC_FLAGS+=( --depth "${SRC_DEPTH}" --yuv "${SRC_YUV}" )
-  if [ "${SRC_RANGE}" = "Full" ]; then ENC_FLAGS+=( --range full ); else ENC_FLAGS+=( --range limited ); fi
-  if [ -n "${SRC_CLLI:-}" ]; then ENC_FLAGS+=( --clli "${SRC_CLLI}" ); fi
-}
-gainmaputil_supports_cicp() { avifgainmaputil combine --help 2>&1 | grep -q -- '--cicp-base'; }
-
-# Try tonemap with safest sequence: (no -d) → 12 → 10 → 8 → 0
-tonemap_alt() {
-  local in="$1" out="$2" head="$3"
-  if avifgainmaputil tonemap "$in" "$out" --headroom "$head"; then
-    [ "$VERBOSE" -eq 1 ] && echo "[info] tonemap OK (default depth)"
-    return 0
+  if [ "${SRC_RANGE}" = "Full" ]; then 
+    ENC_FLAGS+=( --range full )
+    [ "$VERBOSE" -eq 1 ] && echo "[debug] Adding --range full"
+  else 
+    ENC_FLAGS+=( --range limited )
+    [ "$VERBOSE" -eq 1 ] && echo "[debug] Adding --range limited"
   fi
-  for d in 12 10 8 0; do
-    if avifgainmaputil tonemap "$in" "$out" --headroom "$head" -d "$d"; then
-      [ "$VERBOSE" -eq 1 ] && echo "[info] tonemap OK with -d $d"
-      return 0
-    else
-      [ "$VERBOSE" -eq 1 ] && echo "[warn] tonemap -d $d failed; trying next"
-    fi
-  done
-  echo >&2 "[FATAL] avifgainmaputil tonemap failed for all tested modes"
-  return 1
+  if [ -n "${SRC_CLLI:-}" ]; then ENC_FLAGS+=( --clli "${SRC_CLLI}" ); fi
 }
 
 # ---- Gain-map vs pure-HDR branching ----
 if avifgainmaputil printmetadata "$IN" >/dev/null 2>&1; then
-  echo "[GM] Input has a gain-map — preserving it…"
+  echo "[GM] Input has a gain-map - preserving it..."
 
-  # Base (SDR) & Alternate (HDR) renderings
+  # Base (SDR) & Alternate (HDR) renderings; keep high precision for alt
   avifdec "$IN" "$tmp/base.png"
-  tonemap_alt "$IN" "$tmp/alt.png" "$HEADROOM"
+  avifgainmaputil tonemap "$IN" "$tmp/alt.png" --headroom "$HEADROOM" -d 10
 
-  # Resize both identically (Lanczos)
+  # Resize both identically (Lanczos), width-only keeps AR
   magick "$tmp/base.png" -filter Lanczos -resize "${WIDTH}x" "$tmp/base_r.png"
   magick "$tmp/alt.png"  -filter Lanczos -resize "${WIDTH}x" "$tmp/alt_r.png"
 
-  # Base keeps original CICP; alternate explicit PQ so viewers treat it as HDR
-  ALT_P="${SRC_P}"; ALT_T=16; ALT_M="${SRC_M}"
+  # Use the base's original CICP; make alternate explicit PQ (16) so HDR is recognized
+  ALT_P="${SRC_P}"
+  ALT_T=16
+  ALT_M="${SRC_M}"
+  [ "$VERBOSE" -eq 1 ] && echo "[info] Combine CICP - base ${SRC_P}/${SRC_T}/${SRC_M}, alt ${ALT_P}/${ALT_T}/${ALT_M}"
 
-  if gainmaputil_supports_cicp; then
-    [ "$VERBOSE" -eq 1 ] && echo "[info] Combine CICP — base ${SRC_P}/${SRC_T}/${SRC_M}, alt ${ALT_P}/${ALT_T}/${ALT_M}"
-    avifgainmaputil combine "$tmp/base_r.png" "$tmp/alt_r.png" "$OUT" \
-      --downscaling "$DOWNSCALING" --qgain-map "$QGAIN" -q "$QCOLOR" -s "$SPEED" \
-      --cicp-base "${SRC_P}/${SRC_T}/${SRC_M}" \
-      --cicp-alternate "${ALT_P}/${ALT_T}/${ALT_M}"
-  else
-    echo "[warn] avifgainmaputil lacks --cicp-base/--cicp-alternate; combining without explicit alt CICP."
-    avifgainmaputil combine "$tmp/base_r.png" "$tmp/alt_r.png" "$OUT" \
-      --downscaling "$DOWNSCALING" --qgain-map "$QGAIN" -q "$QCOLOR" -s "$SPEED"
-  fi
+  avifgainmaputil combine "$tmp/base_r.png" "$tmp/alt_r.png" "$OUT" \
+    --downscaling "$DOWNSCALING" --qgain-map "$QGAIN" -q "$QCOLOR" -s "$SPEED" \
+    --cicp-base "${SRC_P}/${SRC_T}/${SRC_M}" \
+    --cicp-alternate "${ALT_P}/${ALT_T}/${ALT_M}"
 
-  echo "✔ Wrote (gain-map): $OUT"
-  if [ "$VERBOSE" -eq 1 ]; then
-    avifgainmaputil printmetadata "$OUT" | sed -n '1,120p'
-    avifdec --info "$OUT" | sed -n '1,60p'
-  fi
+  echo "✓ Wrote (gain-map): $OUT"
 
 else
-  echo "[GM] No gain-map — preserving pure-HDR if present (avoiding SDR tonemap)."
+  echo "[GM] No gain-map - preserving pure-HDR if present (avoiding SDR tonemap)."
 
-  # Decode to Y4M (keeps YUV samples). Fallback to ffmpeg if avifdec can't.
-  if ! avifdec "$IN" "$tmp/in.y4m"; then
-    echo "[info] avifdec -> y4m failed; falling back to ffmpeg decode"
-    ffmpeg -nostdin -hide_banner -loglevel error -y -i "$IN" -pix_fmt yuv444p10le "$tmp/in.y4m"
+  # For PQ/HLG content, use PNG to preserve range information
+  if [ "${SRC_T}" = "16" ] || [ "${SRC_T}" = "14" ]; then
+    echo "[info] Using PNG path for PQ/HLG content to preserve range"
+    
+    # Decode to PNG with high precision
+    avifdec "$IN" "$tmp/in.png"
+    
+    # Resize with ImageMagick
+    magick "$tmp/in.png" -filter Lanczos -resize "${WIDTH}x" "$tmp/out.png"
+    
+    build_encode_flags
+    log_encode_flags
+    avifenc "${ENC_FLAGS[@]}" "$tmp/out.png" "$OUT"
+  else
+    # For other content, use Y4M path
+    echo "[info] Using Y4M path for non-PQ/HLG content"
+    
+    # Decode to Y4M (YUV4MPEG2). avifdec supports .y4m output. 
+    avifdec "$IN" "$tmp/in.y4m"
+
+    # Pick pixel format consistent with source depth/YUV (e.g., yuv444p10le)
+    case "${SRC_YUV}" in 444|422|420|400) ;; *) SRC_YUV=444 ;; esac
+    case "${SRC_DEPTH}" in 8|10|12) ;; *) SRC_DEPTH=10 ;; esac
+    FMT="yuv${SRC_YUV}p${SRC_DEPTH}le"
+
+    # Resize in YUV without color transforms; keep AR with height=-2
+    # Use -strict -1 to allow non-standard pixel formats
+    ffmpeg -nostdin -hide_banner -loglevel error -strict -1 -y \
+      -i "$tmp/in.y4m" \
+      -vf "scale=${WIDTH}:-2:flags=lanczos" \
+      -pix_fmt "$FMT" \
+      -strict -1 "$tmp/out.y4m"
+
+    build_encode_flags
+    log_encode_flags
+    avifenc "${ENC_FLAGS[@]}" "$tmp/out.y4m" "$OUT"
   fi
 
-  # Pixel format consistent with source depth/YUV (e.g., yuv444p10le)
-  case "${SRC_YUV}" in 444|422|420|400) ;; *) SRC_YUV=444 ;; esac
-  case "${SRC_DEPTH}" in 8|10|12) ;; *) SRC_DEPTH=10 ;; esac
-  FMT="yuv${SRC_YUV}p${SRC_DEPTH}le"
-
-  ffmpeg -nostdin -hide_banner -loglevel error -y \
-    -i "$tmp/in.y4m" \
-    -vf "scale=${WIDTH}:-2:flags=lanczos" \
-    -pix_fmt "$FMT" \
-    "$tmp/out.y4m"
-
-  build_encode_flags
-  avifenc "${ENC_FLAGS[@]}" "$tmp/out.y4m" "$OUT"
-
-  echo "✔ Wrote (pure-HDR): $OUT"
-  if [ "$VERBOSE" -eq 1 ]; then
-    avifdec --info "$OUT" | sed -n '1,60p'
-  fi
+  echo "✓ Wrote (pure-HDR): $OUT"
 fi
