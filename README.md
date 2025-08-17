@@ -4,6 +4,8 @@ Mostly vibecoded simple tool to resize HDR AVIF images, with and without gain ma
 
 Once to build:
 ```shell
+git clone git@github.com:danieltroger/avif-resizer.git
+cd avif-resizer
 docker build -t avif-gm-resizer .
 ```
 
